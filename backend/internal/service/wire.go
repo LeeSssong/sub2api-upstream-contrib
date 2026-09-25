@@ -1093,8 +1093,9 @@ func ProvideAccountOpsService(settings SettingRepository, repo AccountOpsReposit
 
 // ProvideAccountTokenGuardService 创建并启动「凭证守护」后台巡检（智能运维子页面）。
 func ProvideAccountTokenGuardService(settings SettingRepository, repo AccountTokenGuardRepository,
-	accounts AccountRepository, admin AdminService, invalidator TokenCacheInvalidator) *AccountTokenGuardService {
+	accounts AccountRepository, admin AdminService, invalidator TokenCacheInvalidator, encryptor SecretEncryptor) *AccountTokenGuardService {
 	svc := NewAccountTokenGuardService(settings, repo, accounts, admin, invalidator)
+	svc.SetEncryptor(encryptor)
 	svc.Start()
 	return svc
 }

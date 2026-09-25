@@ -1,6 +1,7 @@
 export default {
+  "secretMaskHint": "Saved secrets are masked as ********. Leave the mask unchanged to preserve a secret; replace it to update. Only configure trusted probe and re-login endpoints: they receive account credentials.",
   "title": "Credential Guard",
-  "description": "Probes access tokens for accounts in the selected groups, re-logs in expired credentials, and restores scheduling for accounts stuck in the error state.",
+  "description": "Probes access tokens for accounts in the selected groups, renews expired credentials, and restores only unchanged isolation created by this guard.",
   "enabled": "Enable credential guard",
   "enabledHint": "When disabled, no probing or repair runs.",
   "groupIds": "Guard group IDs",

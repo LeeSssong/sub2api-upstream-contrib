@@ -33,6 +33,7 @@
           <div class="section-title"><span class="icon-tile"><Icon name="shield" size="md" /></span><div><h3>{{ t('tokenGuard.title') }}</h3><p>{{ t('tokenGuard.enabledHint') }}</p></div></div>
           <form v-if="draft" class="settings-form" @submit.prevent="save">
             <fieldset :disabled="saving">
+              <p class="field-hint">{{ t('tokenGuard.secretMaskHint') }}</p>
               <label class="enable-row"><span><strong>{{ t('tokenGuard.enabled') }}</strong><small>{{ t('tokenGuard.enabledHint') }}</small></span><input v-model="draft.enabled" type="checkbox" role="switch" :aria-label="t('tokenGuard.enabled')" /></label>
               <label class="field-label">{{ t('tokenGuard.groupIds') }}</label>
               <input v-model="groupIdsText" class="input w-full" placeholder="1, 2" />
@@ -65,7 +66,7 @@
               <p class="field-hint">{{ t('tokenGuard.reloginAccountsHint') }}</p>
 
               <div class="grid-2">
-                <label class="field-label">{{ t('tokenGuard.barkKey') }}<input v-model.trim="draft.bark_key" class="input w-full" placeholder="留空则不推送" /></label>
+                <label class="field-label">{{ t('tokenGuard.barkKey') }}<input v-model.trim="draft.bark_key" type="password" autocomplete="new-password" class="input w-full" placeholder="留空则不推送" /></label>
                 <div>
                   <label class="kind-option"><input v-model="draft.notify_on_fix" type="checkbox" /><span><strong>{{ t('tokenGuard.notifyOnFix') }}</strong><small>Bark</small></span></label>
                   <label class="kind-option"><input v-model="draft.notify_on_fail" type="checkbox" /><span><strong>{{ t('tokenGuard.notifyOnFail') }}</strong><small>Bark</small></span></label>

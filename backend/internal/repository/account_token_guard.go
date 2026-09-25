@@ -3,6 +3,8 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -92,4 +94,112 @@ func (r *accountTokenGuardRepository) ListStates(ctx context.Context) ([]service
 func (r *accountTokenGuardRepository) PruneEvents(ctx context.Context, before time.Time) error {
 	_, err := r.db.ExecContext(ctx, `DELETE FROM account_token_guard_events WHERE created_at < $1`, before)
 	return err
+}
+
+// The transaction-scoped advisory lock is released on rollback, connection loss,
+// cancellation, and process exit. It serializes manual and automatic runs.
+func (r *accountTokenGuardRepository) AcquireTokenGuardLease(ctx context.Context) (func(), bool, error) {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, false, err
+	}
+	var acquired bool
+	if err := tx.QueryRowContext(ctx, `SELECT pg_try_advisory_xact_lock(748021390711)`).Scan(&acquired); err != nil {
+		_ = tx.Rollback()
+		return nil, false, err
+	}
+	if !acquired {
+		_ = tx.Rollback()
+		return nil, false, nil
+	}
+	return func() { _ = tx.Rollback() }, true, nil
+}
+
+// Full-snapshot CAS is intentional: any concurrent operator, quality-rule or
+// credential change invalidates the probe/relogin observation. Only approved
+// token fields are merged; unrelated credential settings stay in the database.
+func (r *accountTokenGuardRepository) UpdateCredentialsIfUnchanged(ctx context.Context, expected *service.Account, patch map[string]any) (bool, error) {
+	changes := make(map[string]any)
+	for _, key := range []string{"access_token", "refresh_token", "id_token", "expires_at", "token_type"} {
+		if value, ok := patch[key]; ok {
+			changes[key] = value
+		}
+	}
+	after, err := json.Marshal(changes)
+	if err != nil {
+		return false, err
+	}
+	return r.mutateTokenGuardAccount(ctx, expected, "credentials = COALESCE(credentials, '{}'::jsonb) || $8::jsonb", "", string(after), false, false)
+}
+
+func (r *accountTokenGuardRepository) MarkTokenGuardAuthFailure(ctx context.Context, expected *service.Account) (bool, error) {
+	if expected.Status != service.StatusActive || !expected.Schedulable || expected.ErrorMessage != "" {
+		return false, nil
+	}
+	return r.mutateTokenGuardAccount(ctx, expected,
+		"status = 'error', schedulable = false, error_message = $8",
+		"AND status = 'active' AND schedulable IS TRUE AND COALESCE(error_message,'') = ''"+tokenGuardNoCooldown,
+		service.AccountTokenGuardOwnedError, true, false)
+}
+
+func (r *accountTokenGuardRepository) RecoverTokenGuardOwnedState(ctx context.Context, expected *service.Account) (bool, error) {
+	if expected.Status != service.StatusError || expected.Schedulable || expected.ErrorMessage != service.AccountTokenGuardOwnedError {
+		return false, nil
+	}
+	return r.mutateTokenGuardAccount(ctx, expected,
+		"status = 'active', schedulable = true, error_message = $8",
+		"AND EXISTS (SELECT 1 FROM account_token_guard_ownership o WHERE o.account_id=accounts.id AND o.account_updated_at=accounts.updated_at)"+tokenGuardNoCooldown,
+		"", false, true)
+}
+
+const tokenGuardNoCooldown = `
+ AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until <= NOW())
+ AND (rate_limit_reset_at IS NULL OR rate_limit_reset_at <= NOW())
+ AND (overload_until IS NULL OR overload_until <= NOW())
+ AND (auto_pause_on_expired IS NOT TRUE OR expires_at IS NULL OR expires_at > NOW())`
+
+// Statement fragments are internal constants. Ownership tracks the exact row
+// revision written by this guard, never a free-form error string alone.
+func (r *accountTokenGuardRepository) mutateTokenGuardAccount(ctx context.Context, expected *service.Account, setSQL, whereSQL string, value any, claim, release bool) (bool, error) {
+	before, err := json.Marshal(expected.Credentials)
+	if err != nil {
+		return false, err
+	}
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var revision time.Time
+	err = tx.QueryRowContext(ctx, `UPDATE accounts SET `+setSQL+`, updated_at=GREATEST(clock_timestamp(),updated_at+interval '1 microsecond')
+ WHERE id=$1 AND deleted_at IS NULL AND updated_at=$2 AND credentials=$3::jsonb
+ AND status=$4 AND schedulable=$5 AND COALESCE(error_message,'')=$6
+ AND platform='openai' AND type='oauth' AND parent_account_id IS NULL AND $7::boolean `+whereSQL+` RETURNING updated_at`,
+		expected.ID, expected.UpdatedAt, string(before), expected.Status, expected.Schedulable, expected.ErrorMessage, true, value).Scan(&revision)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if claim {
+		_, err = tx.ExecContext(ctx, `INSERT INTO account_token_guard_ownership(account_id,account_updated_at) VALUES($1,$2)
+   ON CONFLICT(account_id) DO UPDATE SET account_updated_at=EXCLUDED.account_updated_at`, expected.ID, revision)
+	} else if release {
+		_, err = tx.ExecContext(ctx, `DELETE FROM account_token_guard_ownership WHERE account_id=$1`, expected.ID)
+	} else {
+		// A credential-only update keeps ownership only if no intervening change had
+		// already revoked it. Manual writes never renew this revision.
+		_, err = tx.ExecContext(ctx, `UPDATE account_token_guard_ownership SET account_updated_at=$1 WHERE account_id=$2 AND account_updated_at=$3`, revision, expected.ID, expected.UpdatedAt)
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO scheduler_outbox(event_type,account_id,payload) VALUES($1,$2,'{}'::jsonb)`, service.SchedulerOutboxEventAccountChanged, expected.ID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
 }

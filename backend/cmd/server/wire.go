@@ -84,6 +84,7 @@ func providePluginHostInfo(buildInfo handler.BuildInfo) service.PluginHostInfo {
 
 func provideCleanup(
 	requestCaptures *requestcapture.Manager,
+	usageLogRepo service.UsageLogRepository,
 	entClient *ent.Client,
 	rdb *redis.Client,
 	opsMetricsCollector *service.OpsMetricsCollector,
@@ -414,6 +415,12 @@ func provideCleanup(
 		}
 
 		infraSteps := []cleanupStep{
+			{"RequestTiming", func() error {
+				if closer, ok := usageLogRepo.(interface{ CloseRequestTiming(context.Context) error }); ok {
+					return closer.CloseRequestTiming(ctx)
+				}
+				return nil
+			}},
 			{"Redis", func() error {
 				if rdb == nil {
 					return nil

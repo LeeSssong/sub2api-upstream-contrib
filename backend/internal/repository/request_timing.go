@@ -24,8 +24,23 @@ func (r *usageLogRepository) RecordRequestTiming(ctx context.Context, requestID 
 	if c == nil || r.db == nil || requestID == "" {
 		return
 	}
-	r.timingOnce.Do(func() { r.timingQueue = make(chan timingWrite, 512); go r.runTimingWriter() })
+	r.timingMu.Lock()
+	if r.timingClosed {
+		r.timingMu.Unlock()
+		return
+	}
+	r.timingOnce.Do(func() {
+		r.timingQueue = make(chan timingWrite, 512)
+		r.timingDone = make(chan struct{})
+		go r.runTimingWriter()
+	})
+	r.timingMu.Unlock()
 	c.WhenFinished(func(data requesttiming.Snapshot) {
+		r.timingMu.Lock()
+		defer r.timingMu.Unlock()
+		if r.timingClosed {
+			return
+		}
 		select {
 		case r.timingQueue <- timingWrite{requestID, apiKeyID, data}:
 		default:
@@ -34,11 +49,15 @@ func (r *usageLogRepository) RecordRequestTiming(ctx context.Context, requestID 
 	})
 }
 func (r *usageLogRepository) runTimingWriter() {
+	defer close(r.timingDone)
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
 		select {
-		case job := <-r.timingQueue:
+		case job, ok := <-r.timingQueue:
+			if !ok {
+				return
+			}
 			// All errors remain diagnostic-only. A short bounded retry handles transient
 			// SQL failures; it never retries billing or a model request.
 			for attempt := 0; attempt < 3; attempt++ {
@@ -65,6 +84,30 @@ func (r *usageLogRepository) runTimingWriter() {
 		}
 	}
 }
+
+// CloseRequestTiming is called after request and usage producers stop, before
+// the shared database is closed. Already accepted writes are drained.
+func (r *usageLogRepository) CloseRequestTiming(ctx context.Context) error {
+	r.timingMu.Lock()
+	if !r.timingClosed {
+		r.timingClosed = true
+		if r.timingQueue != nil {
+			close(r.timingQueue)
+		}
+	}
+	done := r.timingDone
+	r.timingMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 func (r *usageLogRepository) writeTiming(ctx context.Context, job timingWrite) error {
 	raw, err := json.Marshal(job.data)
 	if err != nil {

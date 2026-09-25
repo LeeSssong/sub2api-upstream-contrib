@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -9,6 +10,16 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/stretchr/testify/require"
 )
+
+type cleanupTimingRepository struct {
+	service.UsageLogRepository
+	closed bool
+}
+
+func (r *cleanupTimingRepository) CloseRequestTiming(context.Context) error {
+	r.closed = true
+	return nil
+}
 
 func TestProvideServiceBuildInfo(t *testing.T) {
 	in := handler.BuildInfo{
@@ -51,8 +62,10 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 	schedulerSnapshotSvc := service.NewSchedulerSnapshotService(nil, nil, nil, nil, cfg)
 	opsSystemLogSinkSvc := service.NewOpsSystemLogSink(nil)
 
+	timingRepo := &cleanupTimingRepository{}
 	cleanup := provideCleanup(
 		nil, // request capture manager
+		timingRepo,
 		nil, // entClient
 		nil, // redis
 		&service.OpsMetricsCollector{},
@@ -107,4 +120,5 @@ func TestProvideCleanup_WithMinimalDependencies_NoPanic(t *testing.T) {
 	require.NotPanics(t, func() {
 		cleanup()
 	})
+	require.True(t, timingRepo.closed, "request timing must be closed during application cleanup")
 }

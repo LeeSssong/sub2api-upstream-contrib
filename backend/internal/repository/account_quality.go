@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/service"
@@ -71,7 +72,11 @@ func (r *scheduledTestPlanRepository) ApplyQualityOutcome(ctx context.Context, p
 	var version time.Time
 	var schedulable bool
 	var status string
-	err = tx.QueryRowContext(ctx, `SELECT updated_at, schedulable, status FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, plan.AccountID).Scan(&version, &schedulable, &status)
+	var recoveryEligible bool
+	err = tx.QueryRowContext(ctx, `SELECT updated_at, schedulable, status,
+ (expires_at IS NULL OR expires_at>NOW()) AND (rate_limit_reset_at IS NULL OR rate_limit_reset_at<=NOW())
+ AND (overload_until IS NULL OR overload_until<=NOW()) AND (temp_unschedulable_until IS NULL OR temp_unschedulable_until<=NOW())
+ AND COALESCE(error_message,'')='' FROM accounts WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, plan.AccountID).Scan(&version, &schedulable, &status, &recoveryEligible)
 	if err == sql.ErrNoRows {
 		return "account_deleted", nil
 	}
@@ -153,10 +158,13 @@ func (r *scheduledTestPlanRepository) ApplyQualityOutcome(ctx context.Context, p
 			}
 		}
 	case outcome == "passed" && state.Action != "" && q.AutoRestore:
-		// Restore only the mutation owned by this quality rule. Other account or
-		// membership edits must not turn an enabled auto-restore rule into a
-		// manual cleanup task. A non-active account is not safe to reactivate.
-		if status != "active" {
+		// Restore only an unchanged revision and membership set owned by this rule.
+		// Even a same-value manual disable advances the revision and must win.
+		var ownedGroups, currentGroups any
+		if json.Unmarshal(state.Remaining, &ownedGroups) != nil || json.Unmarshal(groups, &currentGroups) != nil {
+			return "restore_conflict", nil
+		}
+		if status != "active" || !recoveryEligible || !version.Equal(state.AccountVersion) || !reflect.DeepEqual(ownedGroups, currentGroups) {
 			return "restore_conflict", nil
 		}
 		switch state.Action {

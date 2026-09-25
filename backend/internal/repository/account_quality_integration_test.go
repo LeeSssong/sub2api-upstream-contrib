@@ -44,7 +44,9 @@ func TestQualityActionsRestoreOwnershipAndStaleRuns(t *testing.T) {
 			require.NoError(t, plans.TriggerQuality(ctx, plan.ID))
 			plan, err = plans.GetByID(ctx, plan.ID)
 			require.NoError(t, err)
-			now := time.Now().Truncate(time.Microsecond)
+			var now time.Time
+			require.NoError(t, integrationDB.QueryRowContext(ctx, `SELECT clock_timestamp()`).Scan(&now))
+			now = now.Truncate(time.Microsecond)
 			until := now.Add(15 * time.Minute)
 			ok, err := plans.ClaimPelican(ctx, plan, now, until, now.Add(30*time.Minute))
 			require.NoError(t, err)
@@ -65,6 +67,25 @@ func TestQualityActionsRestoreOwnershipAndStaleRuns(t *testing.T) {
 			var count int
 			require.NoError(t, integrationDB.QueryRowContext(ctx, `SELECT count(*) FROM account_groups WHERE account_id=$1 AND group_id=$2`, account, other).Scan(&count))
 			require.Equal(t, 1, count)
+			for _, field := range []string{"expires_at", "rate_limit_reset_at", "overload_until", "temp_unschedulable_until", "error_message"} {
+				value := "clock_timestamp() + INTERVAL '1 hour'"
+				if field == "expires_at" {
+					value = "clock_timestamp() - INTERVAL '1 hour'"
+				}
+				if field == "error_message" {
+					value = "'another rule owns this block'"
+				}
+				_, err = integrationDB.ExecContext(ctx, "UPDATE accounts SET "+field+"="+value+" WHERE id=$1", account)
+				require.NoError(t, err)
+				require.Equal(t, "restore_conflict", apply("passed"), field)
+				_, err = integrationDB.ExecContext(ctx, "UPDATE accounts SET "+field+"=NULL WHERE id=$1", account)
+				require.NoError(t, err)
+			}
+			_, err = integrationDB.ExecContext(ctx, "UPDATE account_groups SET priority=51 WHERE account_id=$1 AND group_id=$2", account, other)
+			require.NoError(t, err)
+			require.Equal(t, "restore_conflict", apply("passed"), "changed remaining memberships must not be overwritten")
+			_, err = integrationDB.ExecContext(ctx, "UPDATE account_groups SET priority=50 WHERE account_id=$1 AND group_id=$2", account, other)
+			require.NoError(t, err)
 			require.Equal(t, "restored", apply("passed"))
 			var priority int
 			var models string
@@ -72,11 +93,10 @@ func TestQualityActionsRestoreOwnershipAndStaleRuns(t *testing.T) {
 			require.Equal(t, 7, priority)
 			require.JSONEq(t, `["gpt-test"]`, models)
 			require.Equal(t, want, apply("failed"))
-			_, err = integrationDB.ExecContext(ctx, `UPDATE accounts SET updated_at=clock_timestamp(),name='manually edited' WHERE id=$1`, account)
+			_, err = integrationDB.ExecContext(ctx, `UPDATE accounts SET updated_at=clock_timestamp(),schedulable=false,name='manually edited' WHERE id=$1`, account)
 			require.NoError(t, err)
-			// An unrelated account edit does not cancel restoration of the
-			// mutation owned by this quality rule.
-			require.Equal(t, "restored", apply("passed"))
+			// Any account revision change revokes this rule's restoration ownership.
+			require.Equal(t, "restore_conflict", apply("passed"))
 			_, err = integrationDB.ExecContext(ctx, `UPDATE scheduled_test_plans SET enabled=false WHERE id=$1`, plan.ID)
 			require.NoError(t, err)
 			require.Equal(t, "stale_run", apply("failed"))
@@ -119,7 +139,7 @@ func TestQualityActionsRestoreOwnershipAndStaleRuns(t *testing.T) {
 
 			var events int
 			require.NoError(t, integrationDB.QueryRowContext(ctx, `SELECT count(*) FROM scheduler_outbox WHERE account_id=$1 AND event_type='account_groups_changed'`, account).Scan(&events))
-			require.Equal(t, 4, events)
+			require.Equal(t, 3, events)
 		})
 	}
 }
